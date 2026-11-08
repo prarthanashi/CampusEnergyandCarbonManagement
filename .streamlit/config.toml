@@ -1,0 +1,12 @@
+[client]
+showSidebarNavigation = false
+
+[secrets]
+files = [".streamlit/secrets.toml"]
+
+[theme]
+primaryColor = "#2E7D32"
+backgroundColor = "#F9FBF9"
+secondaryBackgroundColor = "#E8F5E9"
+textColor = "#1B3B2B"
+font = "sans serif"
