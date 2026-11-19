@@ -1,24 +1,29 @@
 """
 database.py
 -----------
-Centralized database connection and SQL operations for the Campus Energy
-and Carbon Management System.
+Centralized PostgreSQL connection and SQL operations for the
+Campus Energy & Carbon Management System.
 
-All database queries use parameterized SQL (%s) to prevent SQL injection,
-and transactions (commit/rollback) are implemented for all data modifications.
+Current schema:
+BUILDING, ENERGY_READING, EMISSION_SOURCE, EMISSION_FACTOR, ACTIVITY
+
+Electricity readings are tracked separately from direct carbon emissions.
+Carbon emissions are calculated only from ACTIVITY records:
+quantity * emission_factor.factor_value.
 """
 
 import streamlit as st
 import psycopg2
-from psycopg2 import errors
 import pandas as pd
+from psycopg2 import errors
 
+
+# ---------------------------------------------------------------------
+# CONNECTION
+# ---------------------------------------------------------------------
 
 def get_connection():
-    """
-    Establish and return a connection to the PostgreSQL database
-    using credentials configured in .streamlit/secrets.toml.
-    """
+    """Connect to PostgreSQL using .streamlit/secrets.toml."""
     return psycopg2.connect(
         host=st.secrets["postgres"]["host"],
         port=st.secrets["postgres"]["port"],
@@ -29,9 +34,7 @@ def get_connection():
 
 
 def test_connection():
-    """
-    Test the database connection and return a tuple: (success: bool, message: str).
-    """
+    """Return (True, message) if the database connection works."""
     try:
         conn = get_connection()
         conn.close()
@@ -40,57 +43,49 @@ def test_connection():
         return False, str(exc)
 
 
-# =====================================================================
-# MODULE 2: BUILDING MANAGEMENT DATABASE OPERATIONS
-# =====================================================================
+# ---------------------------------------------------------------------
+# BUILDING MANAGEMENT
+# ---------------------------------------------------------------------
 
 def get_next_building_id():
-    """
-    Retrieve the next suggested integer ID for a new building.
-    Defaults to 101 if the table is empty.
-    """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(building_id), 100) + 1 FROM building;")
+            cur.execute(
+                "SELECT COALESCE(MAX(building_id), 100) + 1 FROM building;"
+            )
             return cur.fetchone()[0]
     finally:
         conn.close()
 
 
 def get_all_buildings():
-    """
-    Retrieve all campus buildings ordered by building_id.
-    Returns a list of tuples: (building_id, building_name, building_type, location).
-    """
+    """Return (building_id, building_name, building_type)."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT building_id, building_name, building_type, location
+                SELECT building_id, building_name, building_type
                 FROM building
-                ORDER BY building_id ASC;
+                ORDER BY building_id;
             """)
             return cur.fetchall()
     finally:
         conn.close()
 
 
-def add_building(building_id, name, building_type, location):
-    """
-    Insert a new building record into the BUILDING table.
-    """
+def add_building(building_id, name, building_type):
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO building (building_id, building_name, building_type, location)
-                VALUES (%s, %s, %s, %s);
-            """, (building_id, name, building_type, location))
+                INSERT INTO building (building_id, building_name, building_type)
+                VALUES (%s, %s, %s);
+            """, (building_id, name, building_type))
         conn.commit()
     except errors.UniqueViolation:
         conn.rollback()
-        raise ValueError(f"A building with ID {building_id} already exists.")
+        raise ValueError("That building ID or building name already exists.")
     except Exception:
         conn.rollback()
         raise
@@ -98,21 +93,21 @@ def add_building(building_id, name, building_type, location):
         conn.close()
 
 
-def update_building(building_id, name, building_type, location):
-    """
-    Update an existing building's details in the BUILDING table.
-    """
+def update_building(building_id, name, building_type):
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE building
-                SET building_name = %s,
-                    building_type = %s,
-                    location = %s
+                SET building_name = %s, building_type = %s
                 WHERE building_id = %s;
-            """, (name, building_type, location, building_id))
+            """, (name, building_type, building_id))
+            if cur.rowcount == 0:
+                raise ValueError("The selected building no longer exists.")
         conn.commit()
+    except errors.UniqueViolation:
+        conn.rollback()
+        raise ValueError("That building name is already in use.")
     except Exception:
         conn.rollback()
         raise
@@ -121,29 +116,20 @@ def update_building(building_id, name, building_type, location):
 
 
 def delete_building(building_id):
-    """
-    Delete a building by building_id.
-    Prevents deletion if existing energy readings reference this building.
-    """
+    """The foreign keys prevent deletion when readings or activities exist."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            # Check for existing readings referencing this building
-            cur.execute("SELECT COUNT(*) FROM energy_reading WHERE building_id = %s;", (building_id,))
-            reading_count = cur.fetchone()[0]
-            if reading_count > 0:
-                raise ValueError(
-                    f"Cannot delete building ID {building_id} because it has {reading_count} "
-                    f"associated energy reading(s). Delete those readings first."
-                )
-
-            cur.execute("DELETE FROM building WHERE building_id = %s;", (building_id,))
+            cur.execute(
+                "DELETE FROM building WHERE building_id = %s;",
+                (building_id,)
+            )
         conn.commit()
     except errors.ForeignKeyViolation:
         conn.rollback()
         raise ValueError(
-            f"Cannot delete building ID {building_id}: foreign key constraint prevents deletion "
-            f"due to referencing records."
+            "This building has energy readings or activities. "
+            "Delete those records first."
         )
     except Exception:
         conn.rollback()
@@ -152,161 +138,17 @@ def delete_building(building_id):
         conn.close()
 
 
-# =====================================================================
-# MODULE 4: EMISSION FACTOR MANAGEMENT DATABASE OPERATIONS
-# =====================================================================
-
-def get_next_factor_id():
-    """
-    Retrieve the next suggested integer ID for a new emission factor.
-    Defaults to 301 if the table is empty.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(factor_id), 300) + 1 FROM emission_factor;")
-            return cur.fetchone()[0]
-    finally:
-        conn.close()
-
-
-def get_all_emission_factors():
-    """
-    Retrieve all emission factors ordered by valid_from date ascending.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT factor_id, factor_name, kg_co2_per_kwh, valid_from
-                FROM emission_factor
-                ORDER BY valid_from ASC, factor_id ASC;
-            """)
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def get_applicable_emission_factor(reading_date):
-    """
-    Find the latest emission factor whose valid_from date is less than or
-    equal to the reading_date.
-    Returns (factor_id, factor_name, kg_co2_per_kwh, valid_from) or None.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT factor_id, factor_name, kg_co2_per_kwh, valid_from
-                FROM emission_factor
-                WHERE valid_from <= %s
-                ORDER BY valid_from DESC, factor_id DESC
-                LIMIT 1;
-            """, (reading_date,))
-            return cur.fetchone()
-    finally:
-        conn.close()
-
-
-def add_emission_factor(factor_id, factor_name, kg_co2_per_kwh, valid_from):
-    """
-    Insert a new emission factor into the EMISSION_FACTOR table.
-    Validates non-negative emission rate.
-    """
-    if kg_co2_per_kwh < 0:
-        raise ValueError("Emission factor (kg CO2/kWh) must be greater than or equal to zero.")
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO emission_factor (factor_id, factor_name, kg_co2_per_kwh, valid_from)
-                VALUES (%s, %s, %s, %s);
-            """, (factor_id, factor_name, kg_co2_per_kwh, valid_from))
-        conn.commit()
-    except errors.UniqueViolation:
-        conn.rollback()
-        raise ValueError(f"An emission factor with name '{factor_name}' and valid date '{valid_from}' or ID {factor_id} already exists.")
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def update_emission_factor(factor_id, factor_name, kg_co2_per_kwh, valid_from):
-    """
-    Update an existing emission factor in the EMISSION_FACTOR table.
-    """
-    if kg_co2_per_kwh < 0:
-        raise ValueError("Emission factor (kg CO2/kWh) must be greater than or equal to zero.")
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE emission_factor
-                SET factor_name = %s,
-                    kg_co2_per_kwh = %s,
-                    valid_from = %s
-                WHERE factor_id = %s;
-            """, (factor_name, kg_co2_per_kwh, valid_from, factor_id))
-        conn.commit()
-    except errors.UniqueViolation:
-        conn.rollback()
-        raise ValueError(f"An emission factor with name '{factor_name}' and valid date '{valid_from}' already exists.")
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def delete_emission_factor(factor_id):
-    """
-    Delete an emission factor if it is not referenced by any energy reading
-    in the READING_FACTOR table.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            # Check if this factor is referenced by any reading in READING_FACTOR
-            cur.execute("SELECT COUNT(*) FROM reading_factor WHERE factor_id = %s;", (factor_id,))
-            ref_count = cur.fetchone()[0]
-            if ref_count > 0:
-                raise ValueError(
-                    f"Cannot delete emission factor ID {factor_id} because it is currently assigned "
-                    f"to {ref_count} energy reading(s)."
-                )
-
-            cur.execute("DELETE FROM emission_factor WHERE factor_id = %s;", (factor_id,))
-        conn.commit()
-    except errors.ForeignKeyViolation:
-        conn.rollback()
-        raise ValueError(
-            f"Cannot delete emission factor ID {factor_id}: foreign key constraint prevents deletion "
-            f"due to referencing records."
-        )
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-# =====================================================================
-# MODULE 3: ENERGY READING & FACTOR ASSIGNMENT DATABASE OPERATIONS
-# =====================================================================
+# ---------------------------------------------------------------------
+# ELECTRICITY CONSUMPTION MONITORING
+# ---------------------------------------------------------------------
 
 def get_next_reading_id():
-    """
-    Retrieve the next suggested integer ID for a new energy reading.
-    Defaults to 201 if the table is empty.
-    """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(reading_id), 200) + 1 FROM energy_reading;")
+            cur.execute(
+                "SELECT COALESCE(MAX(reading_id), 200) + 1 FROM energy_reading;"
+            )
             return cur.fetchone()[0]
     finally:
         conn.close()
@@ -314,29 +156,18 @@ def get_next_reading_id():
 
 def get_all_energy_readings():
     """
-    Retrieve all energy readings with their building details and assigned
-    emission factor. Uses LEFT JOIN to ensure any reading without factor assignment
-    is still visible.
+    Return rows in this order:
+    reading_id, building_id, building_name, building_type,
+    reading_date, consumption_kwh.
     """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
-                    e.reading_id,
-                    b.building_id,
-                    b.building_name,
-                    b.building_type,
-                    e.reading_date,
-                    e.consumption_kwh,
-                    f.factor_id,
-                    f.factor_name,
-                    f.kg_co2_per_kwh,
-                    ROUND(e.consumption_kwh * COALESCE(f.kg_co2_per_kwh, 0), 3) AS emissions_kg
+                SELECT e.reading_id, b.building_id, b.building_name,
+                       b.building_type, e.reading_date, e.consumption_kwh
                 FROM energy_reading e
-                JOIN building b ON e.building_id = b.building_id
-                LEFT JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                LEFT JOIN emission_factor f ON rf.factor_id = f.factor_id
+                JOIN building b ON b.building_id = e.building_id
                 ORDER BY e.reading_date DESC, e.reading_id DESC;
             """)
             return cur.fetchall()
@@ -344,64 +175,24 @@ def get_all_energy_readings():
         conn.close()
 
 
-def add_energy_reading_with_factor(reading_id, building_id, reading_date, consumption_kwh):
-    """
-    Add an energy reading and automatically assign the latest applicable
-    emission factor whose valid_from date <= reading_date.
-
-    Both insertions into ENERGY_READING and READING_FACTOR are executed
-    in a single database transaction. If no applicable factor exists,
-    the transaction is not executed and a ValueError is raised.
-    """
+def add_energy_reading(reading_id, building_id, reading_date, consumption_kwh):
     if consumption_kwh < 0:
-        raise ValueError("Electricity consumption (kWh) must be greater than or equal to zero.")
+        raise ValueError("Electricity consumption cannot be negative.")
 
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            # Step 1 & 2: Find latest applicable emission factor
             cur.execute("""
-                SELECT factor_id, factor_name, valid_from
-                FROM emission_factor
-                WHERE valid_from <= %s
-                ORDER BY valid_from DESC, factor_id DESC
-                LIMIT 1;
-            """, (reading_date,))
-            factor_row = cur.fetchone()
-
-            if not factor_row:
-                raise ValueError(
-                    f"No applicable emission factor found for date {reading_date}. "
-                    f"Please add an emission factor with a 'Valid From' date on or before {reading_date}."
-                )
-
-            factor_id = factor_row[0]
-
-            # Step 3: Insert into ENERGY_READING
-            cur.execute("""
-                INSERT INTO energy_reading (reading_id, building_id, reading_date, consumption_kwh)
+                INSERT INTO energy_reading
+                    (reading_id, building_id, reading_date, consumption_kwh)
                 VALUES (%s, %s, %s, %s);
             """, (reading_id, building_id, reading_date, consumption_kwh))
-
-            # Step 4: Insert factor assignment into READING_FACTOR
-            cur.execute("""
-                INSERT INTO reading_factor (reading_id, factor_id)
-                VALUES (%s, %s);
-            """, (reading_id, factor_id))
-
         conn.commit()
-    except errors.UniqueViolation as uv:
+    except errors.UniqueViolation:
         conn.rollback()
-        err_msg = str(uv)
-        if "energy_reading_building_id_reading_date_key" in err_msg or "reading_date" in err_msg:
-            raise ValueError(
-                f"A reading for this building on date {reading_date} already exists. "
-                f"Duplicate readings on the same date are not allowed."
-            )
-        elif "energy_reading_pkey" in err_msg or "reading_id" in err_msg:
-            raise ValueError(f"Reading ID {reading_id} already exists. Please choose a different ID.")
-        else:
-            raise ValueError(f"Unique constraint violation: {err_msg}")
+        raise ValueError(
+            "This reading ID or building/date combination already exists."
+        )
     except Exception:
         conn.rollback()
         raise
@@ -409,56 +200,28 @@ def add_energy_reading_with_factor(reading_id, building_id, reading_date, consum
         conn.close()
 
 
-def update_energy_reading(reading_id, building_id, reading_date, consumption_kwh):
-    """
-    Update an existing energy reading and re-assign the applicable emission factor
-    based on the reading_date.
-    """
+def update_energy_reading(reading_id, building_id, reading_date,
+                          consumption_kwh):
     if consumption_kwh < 0:
-        raise ValueError("Electricity consumption (kWh) must be greater than or equal to zero.")
+        raise ValueError("Electricity consumption cannot be negative.")
 
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            # Find applicable factor for the updated date
-            cur.execute("""
-                SELECT factor_id
-                FROM emission_factor
-                WHERE valid_from <= %s
-                ORDER BY valid_from DESC, factor_id DESC
-                LIMIT 1;
-            """, (reading_date,))
-            factor_row = cur.fetchone()
-
-            if not factor_row:
-                raise ValueError(
-                    f"No applicable emission factor found for date {reading_date}. "
-                    f"An emission factor valid on or before {reading_date} is required."
-                )
-
-            factor_id = factor_row[0]
-
-            # Update ENERGY_READING
             cur.execute("""
                 UPDATE energy_reading
-                SET building_id = %s,
-                    reading_date = %s,
+                SET building_id = %s, reading_date = %s,
                     consumption_kwh = %s
                 WHERE reading_id = %s;
             """, (building_id, reading_date, consumption_kwh, reading_id))
-
-            # Update or insert into READING_FACTOR
-            cur.execute("""
-                INSERT INTO reading_factor (reading_id, factor_id)
-                VALUES (%s, %s)
-                ON CONFLICT (reading_id) DO UPDATE
-                SET factor_id = EXCLUDED.factor_id;
-            """, (reading_id, factor_id))
-
+            if cur.rowcount == 0:
+                raise ValueError("The selected reading no longer exists.")
         conn.commit()
     except errors.UniqueViolation:
         conn.rollback()
-        raise ValueError(f"A reading for this building on date {reading_date} already exists.")
+        raise ValueError(
+            "This building already has a reading for that date."
+        )
     except Exception:
         conn.rollback()
         raise
@@ -467,17 +230,13 @@ def update_energy_reading(reading_id, building_id, reading_date, consumption_kwh
 
 
 def delete_energy_reading(reading_id):
-    """
-    Delete an energy reading. Deletes the corresponding record in READING_FACTOR
-    first to respect the foreign key constraint.
-    """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            # Delete from reading_factor first
-            cur.execute("DELETE FROM reading_factor WHERE reading_id = %s;", (reading_id,))
-            # Delete from energy_reading
-            cur.execute("DELETE FROM energy_reading WHERE reading_id = %s;", (reading_id,))
+            cur.execute(
+                "DELETE FROM energy_reading WHERE reading_id = %s;",
+                (reading_id,)
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -486,293 +245,271 @@ def delete_energy_reading(reading_id):
         conn.close()
 
 
-# =====================================================================
-# MODULE 1 & 5: DASHBOARD & CARBON EMISSION CALCULATION OPERATIONS
-# =====================================================================
+# ---------------------------------------------------------------------
+# EMISSION SOURCES AND STATIC EMISSION FACTORS
+# ---------------------------------------------------------------------
 
-def get_dashboard_summary_metrics():
+def get_emission_sources_with_factors():
     """
-    Retrieve core KPIs for the dashboard:
-    1. Total number of buildings (COUNT)
-    2. Total electricity consumption in kWh (SUM)
-    3. Total carbon emissions in kg CO2 (SUM with join)
-    4. Average electricity consumption per reading in kWh (AVG)
+    Return source_id, source_name, measurement_unit, factor_id,
+    factor_value and factor_unit for the read-only factor table.
     """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            # Building count
-            cur.execute("SELECT COUNT(*) FROM building;")
-            total_buildings = cur.fetchone()[0] or 0
-
-            # Total and average consumption
             cur.execute("""
-                SELECT 
-                    COALESCE(SUM(consumption_kwh), 0),
-                    COALESCE(AVG(consumption_kwh), 0)
-                FROM energy_reading;
+                SELECT s.source_id, s.source_name, s.measurement_unit,
+                       f.factor_id, f.factor_value, f.factor_unit
+                FROM emission_source s
+                JOIN emission_factor f ON f.source_id = s.source_id
+                ORDER BY s.source_id;
             """)
-            sum_row = cur.fetchone()
-            total_kwh = float(sum_row[0] or 0.0)
-            avg_kwh = float(sum_row[1] or 0.0)
-
-            # Total carbon emissions calculated via SQL Join
-            cur.execute("""
-                SELECT COALESCE(SUM(e.consumption_kwh * f.kg_co2_per_kwh), 0)
-                FROM energy_reading e
-                JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                JOIN emission_factor f ON rf.factor_id = f.factor_id;
-            """)
-            total_emissions = float(cur.fetchone()[0] or 0.0)
-
-            return {
-                "total_buildings": total_buildings,
-                "total_consumption_kwh": total_kwh,
-                "total_emissions_kg": total_emissions,
-                "avg_consumption_kwh": avg_kwh
-            }
+            return cur.fetchall()
     finally:
         conn.close()
 
+
+# Alias for pages that use the shorter function name.
+def get_all_emission_sources_with_factors():
+    return get_emission_sources_with_factors()
+
+
+# ---------------------------------------------------------------------
+# ACTIVITY ENTRY AND CARBON EMISSION CALCULATION
+# ---------------------------------------------------------------------
+
+def get_next_activity_id():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(MAX(activity_id), 500) + 1 FROM activity;"
+            )
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def add_activity(activity_id, building_id, source_id,
+                 activity_date, quantity, factor_id):
+    """Insert an activity after checking that its factor belongs to its source."""
+    if quantity < 0:
+        raise ValueError("Activity quantity cannot be negative.")
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1
+                FROM emission_factor
+                WHERE factor_id = %s AND source_id = %s;
+            """, (factor_id, source_id))
+            if cur.fetchone() is None:
+                raise ValueError(
+                    "The selected emission factor does not belong to this source."
+                )
+
+            cur.execute("""
+                INSERT INTO activity
+                    (activity_id, building_id, source_id,
+                     activity_date, quantity, factor_id)
+                VALUES (%s, %s, %s, %s, %s, %s);
+            """, (
+                activity_id, building_id, source_id,
+                activity_date, quantity, factor_id
+            ))
+        conn.commit()
+    except errors.UniqueViolation:
+        conn.rollback()
+        raise ValueError("That activity ID already exists.")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_activity(activity_id, building_id, source_id,
+                    activity_date, quantity, factor_id):
+    if quantity < 0:
+        raise ValueError("Activity quantity cannot be negative.")
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1
+                FROM emission_factor
+                WHERE factor_id = %s AND source_id = %s;
+            """, (factor_id, source_id))
+            if cur.fetchone() is None:
+                raise ValueError(
+                    "The selected emission factor does not belong to this source."
+                )
+
+            cur.execute("""
+                UPDATE activity
+                SET building_id = %s, source_id = %s, activity_date = %s,
+                    quantity = %s, factor_id = %s
+                WHERE activity_id = %s;
+            """, (
+                building_id, source_id, activity_date,
+                quantity, factor_id, activity_id
+            ))
+            if cur.rowcount == 0:
+                raise ValueError("The selected activity no longer exists.")
+        conn.commit()
+    except errors.UniqueViolation:
+        conn.rollback()
+        raise ValueError("That activity conflicts with an existing record.")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_activity(activity_id):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM activity WHERE activity_id = %s;",
+                (activity_id,)
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_all_activities_with_emissions():
+    """
+    Return a DataFrame containing activity details and calculated emissions.
+    Emissions = quantity * factor_value.
+    """
+    conn = get_connection()
+    try:
+        query = """
+            SELECT a.activity_id, a.building_id, a.source_id, a.factor_id,
+                   b.building_name, s.source_name,
+                   a.activity_date, a.quantity, s.measurement_unit,
+                   f.factor_value, f.factor_unit,
+                   ROUND((a.quantity * f.factor_value)::numeric, 3)
+                       AS calculated_emissions
+            FROM activity a
+            JOIN building b ON b.building_id = a.building_id
+            JOIN emission_source s ON s.source_id = a.source_id
+            JOIN emission_factor f ON f.factor_id = a.factor_id
+            ORDER BY a.activity_date DESC, a.activity_id DESC;
+        """
+        return pd.read_sql_query(query, conn)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------
+# DASHBOARD / REPORT GENERATION
+# ---------------------------------------------------------------------
 
 def get_building_consumption_breakdown():
     """
-    Aggregate electricity consumption and carbon emissions grouped by building.
-    Uses LEFT JOIN so buildings without readings are displayed with 0.
+    Return each building's electricity consumption and direct emissions.
+    The two totals are aggregated separately to avoid multiplying rows
+    when a building has several electricity readings and activities.
     """
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT 
-                    b.building_name,
-                    b.building_type,
-                    COALESCE(SUM(e.consumption_kwh), 0) AS total_consumption_kwh,
-                    COALESCE(SUM(e.consumption_kwh * f.kg_co2_per_kwh), 0) AS total_emissions_kg
-                FROM building b
-                LEFT JOIN energy_reading e ON b.building_id = e.building_id
-                LEFT JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                LEFT JOIN emission_factor f ON rf.factor_id = f.factor_id
-                GROUP BY b.building_id, b.building_name, b.building_type
-                ORDER BY total_consumption_kwh DESC;
-            """)
-            rows = cur.fetchall()
-            return pd.DataFrame(
-                rows,
-                columns=["Building Name", "Building Type", "Total Consumption (kWh)", "Total Emissions (kg CO2)"]
+        query = """
+            WITH energy_totals AS (
+                SELECT building_id, SUM(consumption_kwh) AS total_kwh
+                FROM energy_reading
+                GROUP BY building_id
+            ),
+            emission_totals AS (
+                SELECT a.building_id,
+                       SUM(a.quantity * f.factor_value) AS total_emissions
+                FROM activity a
+                JOIN emission_factor f ON f.factor_id = a.factor_id
+                GROUP BY a.building_id
             )
+            SELECT b.building_name, b.building_type,
+                   COALESCE(e.total_kwh, 0) AS total_consumption_kwh,
+                   COALESCE(c.total_emissions, 0) AS total_emissions_kg
+            FROM building b
+            LEFT JOIN energy_totals e ON e.building_id = b.building_id
+            LEFT JOIN emission_totals c ON c.building_id = b.building_id
+            ORDER BY total_consumption_kwh DESC;
+        """
+        return pd.read_sql_query(query, conn)
     finally:
         conn.close()
 
 
+def get_monthly_dashboard_data():
+    """Return monthly electricity totals and direct emissions totals."""
+    conn = get_connection()
+    try:
+        query = """
+            WITH monthly_energy AS (
+                SELECT DATE_TRUNC('month', reading_date)::date AS month,
+                       SUM(consumption_kwh) AS total_consumption
+                FROM energy_reading
+                GROUP BY DATE_TRUNC('month', reading_date)
+            ),
+            monthly_emissions AS (
+                SELECT DATE_TRUNC('month', a.activity_date)::date AS month,
+                       SUM(a.quantity * f.factor_value) AS total_emissions
+                FROM activity a
+                JOIN emission_factor f ON f.factor_id = a.factor_id
+                GROUP BY DATE_TRUNC('month', a.activity_date)
+            )
+            SELECT COALESCE(e.month, c.month) AS month,
+                   COALESCE(e.total_consumption, 0) AS total_consumption_kwh,
+                   COALESCE(c.total_emissions, 0) AS total_emissions_kg
+            FROM monthly_energy e
+            FULL OUTER JOIN monthly_emissions c ON e.month = c.month
+            ORDER BY month;
+        """
+        return pd.read_sql_query(query, conn)
+    finally:
+        conn.close()
+
+
+# Backward-compatible name if the dashboard page still imports this function.
 def get_datewise_consumption_breakdown():
-    """
-    Aggregate electricity consumption and carbon emissions grouped by reading date.
-    Ordered chronologically.
-    """
+    return get_monthly_dashboard_data()
+
+
+def get_dashboard_summary_metrics():
+    """Return simple totals if another page still needs these metrics."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM building;")
+            total_buildings = cur.fetchone()[0]
+
             cur.execute("""
-                SELECT 
-                    e.reading_date,
-                    SUM(e.consumption_kwh) AS total_kwh,
-                    COALESCE(SUM(e.consumption_kwh * f.kg_co2_per_kwh), 0) AS total_emissions_kg
-                FROM energy_reading e
-                LEFT JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                LEFT JOIN emission_factor f ON rf.factor_id = f.factor_id
-                GROUP BY e.reading_date
-                ORDER BY e.reading_date ASC;
+                SELECT COALESCE(SUM(consumption_kwh), 0),
+                       COALESCE(AVG(consumption_kwh), 0)
+                FROM energy_reading;
             """)
-            rows = cur.fetchall()
-            return pd.DataFrame(
-                rows,
-                columns=["Reading Date", "Total Consumption (kWh)", "Total Emissions (kg CO2)"]
-            )
-    finally:
-        conn.close()
+            total_kwh, average_kwh = cur.fetchone()
 
-
-def get_detailed_carbon_emissions():
-    """
-    Module 5: Carbon Emission Calculation.
-    Retrieves detailed records by joining BUILDING, ENERGY_READING,
-    READING_FACTOR, and EMISSION_FACTOR.
-    Calculates Carbon Emission (kg CO2) = Consumption (kWh) * Emission Factor.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
-                    b.building_name,
-                    b.building_type,
-                    e.reading_date,
-                    e.consumption_kwh,
-                    f.factor_name,
-                    f.kg_co2_per_kwh,
-                    ROUND(e.consumption_kwh * f.kg_co2_per_kwh, 3) AS calculated_emissions_kg
-                FROM building b
-                JOIN energy_reading e ON b.building_id = e.building_id
-                JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                JOIN emission_factor f ON rf.factor_id = f.factor_id
-                ORDER BY e.reading_date DESC, b.building_name ASC;
+                SELECT COALESCE(SUM(a.quantity * f.factor_value), 0)
+                FROM activity a
+                JOIN emission_factor f ON f.factor_id = a.factor_id;
             """)
-            rows = cur.fetchall()
-            return pd.DataFrame(
-                rows,
-                columns=[
-                    "Building Name",
-                    "Building Type",
-                    "Reading Date",
-                    "Consumption (kWh)",
-                    "Factor Name",
-                    "Emission Factor (kg CO2/kWh)",
-                    "Calculated Emissions (kg CO2)"
-                ]
-            )
-    finally:
-        conn.close()
+            total_emissions = cur.fetchone()[0]
 
-
-def get_buildingwise_carbon_emissions():
-    """
-    Module 5: Aggregate carbon emissions grouped by building.
-    Uses SQL GROUP BY, SUM, AVG, and COUNT.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT 
-                    b.building_name,
-                    b.building_type,
-                    COUNT(e.reading_id) AS total_readings,
-                    ROUND(SUM(e.consumption_kwh), 2) AS total_consumption_kwh,
-                    ROUND(AVG(e.consumption_kwh), 2) AS avg_consumption_kwh,
-                    ROUND(SUM(e.consumption_kwh * f.kg_co2_per_kwh), 3) AS total_emissions_kg
-                FROM building b
-                JOIN energy_reading e ON b.building_id = e.building_id
-                JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                JOIN emission_factor f ON rf.factor_id = f.factor_id
-                GROUP BY b.building_id, b.building_name, b.building_type
-                ORDER BY total_emissions_kg DESC;
-            """)
-            rows = cur.fetchall()
-            return pd.DataFrame(
-                rows,
-                columns=[
-                    "Building Name",
-                    "Building Type",
-                    "Total Readings",
-                    "Total Consumption (kWh)",
-                    "Avg Consumption (kWh)",
-                    "Total Emissions (kg CO2)"
-                ]
-            )
-    finally:
-        conn.close()
-
-
-def get_datewise_carbon_emissions():
-    """
-    Module 5: Aggregate carbon emissions grouped by date.
-    Uses SQL GROUP BY, SUM, and COUNT.
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT 
-                    e.reading_date,
-                    COUNT(e.reading_id) AS buildings_recorded,
-                    ROUND(SUM(e.consumption_kwh), 2) AS total_consumption_kwh,
-                    ROUND(SUM(e.consumption_kwh * f.kg_co2_per_kwh), 3) AS total_emissions_kg
-                FROM energy_reading e
-                JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                JOIN emission_factor f ON rf.factor_id = f.factor_id
-                GROUP BY e.reading_date
-                ORDER BY e.reading_date ASC;
-            """)
-            rows = cur.fetchall()
-            return pd.DataFrame(
-                rows,
-                columns=[
-                    "Reading Date",
-                    "Buildings Recorded",
-                    "Total Consumption (kWh)",
-                    "Total Emissions (kg CO2)"
-                ]
-            )
-    finally:
-        conn.close()
-
-
-# =====================================================================
-# MODULE 6: REPORT GENERATION DATABASE OPERATIONS
-# =====================================================================
-
-def get_filtered_report_data(building_id=None, start_date=None, end_date=None):
-    """
-    Module 6: Report Generation.
-    Filters energy and carbon records by building and date range.
-    Parameters:
-      building_id: int or None (if None, all buildings are included)
-      start_date: date or None
-      end_date: date or None
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            query = """
-                SELECT 
-                    b.building_id,
-                    b.building_name,
-                    b.building_type,
-                    b.location,
-                    e.reading_date,
-                    e.consumption_kwh,
-                    f.factor_name,
-                    f.kg_co2_per_kwh,
-                    ROUND(e.consumption_kwh * f.kg_co2_per_kwh, 3) AS calculated_emissions_kg
-                FROM building b
-                JOIN energy_reading e ON b.building_id = e.building_id
-                JOIN reading_factor rf ON e.reading_id = rf.reading_id
-                JOIN emission_factor f ON rf.factor_id = f.factor_id
-                WHERE (%s IS NULL OR b.building_id = %s)
-                  AND (%s::date IS NULL OR e.reading_date >= %s)
-                  AND (%s::date IS NULL OR e.reading_date <= %s)
-                ORDER BY e.reading_date DESC, b.building_name ASC;
-            """
-            cur.execute(query, (building_id, building_id, start_date, start_date, end_date, end_date))
-            rows = cur.fetchall()
-            return pd.DataFrame(
-                rows,
-                columns=[
-                    "Building ID",
-                    "Building Name",
-                    "Building Type",
-                    "Location",
-                    "Reading Date",
-                    "Consumption (kWh)",
-                    "Emission Factor Name",
-                    "Emission Factor (kg CO2/kWh)",
-                    "Calculated Emissions (kg CO2)"
-                ]
-            )
-    finally:
-        conn.close()
-
-
-def get_min_max_reading_dates():
-    """
-    Retrieve the minimum and maximum reading dates available in ENERGY_READING.
-    Returns (min_date, max_date).
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT MIN(reading_date), MAX(reading_date) FROM energy_reading;")
-            return cur.fetchone()
+            return {
+                "total_buildings": total_buildings,
+                "total_consumption_kwh": float(total_kwh or 0),
+                "avg_consumption_kwh": float(average_kwh or 0),
+                "total_emissions_kg": float(total_emissions or 0)
+            }
     finally:
         conn.close()
