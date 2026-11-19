@@ -1,21 +1,10 @@
-"""
-pages/energy_monitoring.py
---------------------------
-Module 3: Energy Consumption Monitoring for Campus Energy & Carbon Management System.
-Allows recording daily electricity consumption (kWh) per campus building.
-Automatically determines and assigns the appropriate emission factor via READING_FACTOR.
-Enforces the UNIQUE(building_id, reading_date) constraint and non-negative consumption.
-"""
-
 import streamlit as st
-import pandas as pd
 from datetime import date
 from database import (
     get_all_buildings,
     get_all_energy_readings,
     get_next_reading_id,
-    get_applicable_emission_factor,
-    add_energy_reading_with_factor,
+    add_energy_reading,
     update_energy_reading,
     delete_energy_reading
 )
@@ -23,237 +12,160 @@ from database import (
 
 def render_energy_monitoring_page():
     st.header("⚡ Energy Consumption Monitoring")
-    st.write(
-        "Log, inspect, update, and manage campus electricity meter readings (kWh). "
-        "The system automatically maps each reading to the latest applicable emission factor."
-    )
+    st.write("Monitor electricity consumption across campus buildings.")
 
-    tab_view, tab_add, tab_update, tab_delete = st.tabs([
-        "📊 View Energy Readings",
-        "➕ Record New Reading",
-        "✏️ Update Reading",
-        "🗑️ Delete Reading"
-    ])
+    buildings = get_all_buildings()
+    readings = get_all_energy_readings()
 
-    # =========================================================================
-    # TAB 1: VIEW READINGS
-    # =========================================================================
-    with tab_view:
-        st.subheader("Logged Campus Energy Readings")
-        readings = get_all_energy_readings()
+    if readings:
+        header = st.columns([1, 1.8, 1.3, 1.2, 1.3, 1.7])
+        labels = [
+            "Reading ID", "Building", "Building Type",
+            "Reading Date", "Consumption (kWh)", "Actions"
+        ]
+        for column, label in zip(header, labels):
+            column.markdown(f"**{label}**")
 
-        if readings:
-            df = pd.DataFrame(
-                readings,
-                columns=[
-                    "Reading ID",
-                    "Building ID",
-                    "Building Name",
-                    "Building Type",
-                    "Reading Date",
-                    "Consumption (kWh)",
-                    "Factor ID",
-                    "Assigned Factor Name",
-                    "Factor Rate (kg CO2/kWh)",
-                    "Emissions (kg CO2)"
-                ]
-            )
+        for reading in readings:
+            row = st.columns([1, 1.8, 1.3, 1.2, 1.3, 1.7])
+            row[0].write(reading[0])
+            row[1].write(reading[2])
+            row[2].write(reading[3])
+            row[3].write(reading[4])
+            row[4].write(f"{reading[5]:,.3f}")
+            edit_button, delete_button = row[5].columns(2)
 
-            # Reorder columns for optimal readability
-            display_df = df[[
-                "Reading ID",
-                "Building Name",
-                "Building Type",
-                "Reading Date",
-                "Consumption (kWh)",
-                "Assigned Factor Name",
-                "Factor Rate (kg CO2/kWh)",
-                "Emissions (kg CO2)"
-            ]]
-            st.dataframe(display_df, use_container_width=True)
-            st.caption(f"Total Readings Logged: {len(readings)}")
-        else:
-            st.info("No energy readings found in the database.")
+            if edit_button.button("Edit", key=f"edit_reading_{reading[0]}"):
+                st.session_state["editing_reading_id"] = reading[0]
+                st.session_state.pop("deleting_reading_id", None)
 
-    # =========================================================================
-    # TAB 2: RECORD NEW READING
-    # =========================================================================
-    with tab_add:
-        st.subheader("Record New Electricity Consumption")
-        buildings = get_all_buildings()
+            if delete_button.button("Delete", key=f"delete_reading_{reading[0]}"):
+                st.session_state["deleting_reading_id"] = reading[0]
+                st.session_state.pop("editing_reading_id", None)
 
-        if not buildings:
-            st.warning("Please add at least one campus building before recording energy readings.")
-        else:
-            next_reading_id = get_next_reading_id()
+        st.caption(f"Total Readings: {len(readings)}")
 
-            # Building selection
-            selected_building = st.selectbox(
-                "Select Building",
-                buildings,
-                format_func=lambda b: f"ID {b[0]} - {b[1]} ({b[2]})",
-                key="add_reading_building_select"
-            )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                reading_date = st.date_input(
-                    "Reading Date",
-                    value=date.today(),
-                    help="Date on which electricity meter reading was taken"
-                )
-            with col2:
-                reading_id_input = st.number_input(
-                    "Reading ID",
-                    min_value=1,
-                    value=int(next_reading_id),
-                    step=1,
-                    help="Unique integer identifier for the energy reading"
-                )
-
-            consumption_kwh = st.number_input(
-                "Electricity Consumption (kWh)",
-                min_value=0.0,
-                value=100.0,
-                step=10.0,
-                format="%.3f",
-                help="Meter reading in kilowatt-hours (must be >= 0)"
-            )
-
-            # Live preview of applicable emission factor
-            applicable_factor = get_applicable_emission_factor(reading_date)
-            if applicable_factor:
-                st.success(
-                    f"🌿 Applicable Factor Detected: **{applicable_factor[1]}** "
-                    f"({float(applicable_factor[2]):.6f} kg CO₂/kWh, valid from {applicable_factor[3]})."
-                )
-                estimated_co2 = float(consumption_kwh) * float(applicable_factor[2])
-                st.caption(f"Estimated Carbon Emission: **{estimated_co2:,.2f} kg CO₂**")
-            else:
-                st.error(
-                    f"⚠️ No emission factor is valid on or before **{reading_date}**. "
-                    f"You must create a valid emission factor in the Emission Factor module before saving this reading."
-                )
-
-            if st.button("➕ Save Energy Reading", disabled=(applicable_factor is None)):
-                try:
-                    add_energy_reading_with_factor(
-                        reading_id=int(reading_id_input),
-                        building_id=int(selected_building[0]),
-                        reading_date=reading_date,
-                        consumption_kwh=float(consumption_kwh)
-                    )
-                    st.success(
-                        f"Successfully recorded reading ID {reading_id_input} for '{selected_building[1]}' "
-                        f"with factor '{applicable_factor[1]}'."
-                    )
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not record reading: {exc}")
-
-    # =========================================================================
-    # TAB 3: UPDATE READING
-    # =========================================================================
-    with tab_update:
-        st.subheader("Update an Existing Energy Reading")
-        readings = get_all_energy_readings()
-        buildings = get_all_buildings()
-
-        if readings and buildings:
-            # Map building IDs for dropdown selection
-            building_map = {b[0]: b for b in buildings}
-
-            selected_reading = st.selectbox(
-                "Select a reading to edit",
-                readings,
-                format_func=lambda r: (
-                    f"Reading ID {r[0]} | {r[2]} | Date: {r[4]} | {float(r[5]):,.1f} kWh"
+        editing_id = st.session_state.get("editing_reading_id")
+        selected_reading = next(
+            (reading for reading in readings if reading[0] == editing_id),
+            None
+        )
+        if selected_reading:
+            st.subheader(f"Edit Reading {selected_reading[0]}")
+            building_index = next(
+                (
+                    index for index, building in enumerate(buildings)
+                    if building[0] == selected_reading[1]
                 ),
-                key="select_update_reading"
+                0
             )
-
-            current_building_id = selected_reading[1]
-            current_building = building_map.get(current_building_id, buildings[0])
-            building_index = (
-                [b[0] for b in buildings].index(current_building_id)
-                if current_building_id in [b[0] for b in buildings] else 0
-            )
-
-            with st.form(f"form_update_reading_{selected_reading[0]}"):
-                st.info(f"Modifying Reading ID: {selected_reading[0]}")
-
-                updated_building = st.selectbox(
-                    "Campus Building",
+            with st.form("edit_energy_reading_form"):
+                building = st.selectbox(
+                    "Select Building",
                     buildings,
                     index=building_index,
-                    format_func=lambda b: f"ID {b[0]} - {b[1]} ({b[2]})"
+                    format_func=lambda item: f"{item[1]} ({item[2]})"
+                )
+                reading_date = st.date_input(
+                    "Reading Date", value=selected_reading[4]
+                )
+                consumption = st.number_input(
+                    "Electricity Consumption (kWh)",
+                    min_value=0.0,
+                    value=float(selected_reading[5]),
+                    step=10.0,
+                    format="%.3f"
+                )
+                save_column, cancel_column = st.columns(2)
+                with save_column:
+                    submitted = st.form_submit_button("Save Changes")
+                with cancel_column:
+                    cancelled = st.form_submit_button("Cancel")
+
+                if submitted:
+                    try:
+                        update_energy_reading(
+                            selected_reading[0],
+                            int(building[0]),
+                            reading_date,
+                            float(consumption)
+                        )
+                        st.session_state.pop("editing_reading_id", None)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not update reading: {exc}")
+
+                if cancelled:
+                    st.session_state.pop("editing_reading_id", None)
+                    st.rerun()
+    else:
+        st.info("No electricity readings recorded yet.")
+
+    deleting_id = st.session_state.get("deleting_reading_id")
+    selected_for_deletion = next(
+        (reading for reading in readings if reading[0] == deleting_id),
+        None
+    )
+    if selected_for_deletion:
+        st.warning(
+            f"Delete reading {deleting_id} for {selected_for_deletion[2]}?"
+        )
+        confirm, cancel = st.columns(2)
+        if confirm.button("Confirm Delete", key="confirm_delete_reading"):
+            try:
+                delete_energy_reading(deleting_id)
+                st.session_state.pop("deleting_reading_id", None)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not delete reading: {exc}")
+
+        if cancel.button("Cancel", key="cancel_delete_reading"):
+            st.session_state.pop("deleting_reading_id", None)
+            st.rerun()
+
+    st.divider()
+
+    with st.expander("➕ Add Electricity Reading"):
+        if not buildings:
+            st.warning("Add a building before recording electricity consumption.")
+        else:
+            with st.form("add_energy_reading", clear_on_submit=True):
+                reading_id = st.number_input(
+                    "Reading ID",
+                    min_value=1,
+                    value=int(get_next_reading_id()),
+                    step=1
                 )
 
-                col_u1, col_u2 = st.columns(2)
-                with col_u1:
-                    updated_date = st.date_input(
-                        "Reading Date",
-                        value=selected_reading[4]
-                    )
-                with col_u2:
-                    updated_kwh = st.number_input(
-                        "Electricity Consumption (kWh)",
-                        min_value=0.0,
-                        value=float(selected_reading[5]),
-                        step=10.0,
-                        format="%.3f"
-                    )
+                building = st.selectbox(
+                    "Select Building",
+                    buildings,
+                    format_func=lambda item: f"{item[1]} ({item[2]})"
+                )
 
-                submit_update_reading = st.form_submit_button("💾 Update Reading")
+                reading_date = st.date_input(
+                    "Reading Date", value=date.today()
+                )
 
-            if submit_update_reading:
-                try:
-                    update_energy_reading(
-                        reading_id=selected_reading[0],
-                        building_id=int(updated_building[0]),
-                        reading_date=updated_date,
-                        consumption_kwh=float(updated_kwh)
-                    )
-                    st.success(f"Reading ID {selected_reading[0]} updated successfully!")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not update reading: {exc}")
-        else:
-            st.info("No energy readings available to update.")
+                consumption = st.number_input(
+                    "Electricity Consumption (kWh)",
+                    min_value=0.0,
+                    value=100.0,
+                    step=10.0,
+                    format="%.3f"
+                )
 
-    # =========================================================================
-    # TAB 4: DELETE READING
-    # =========================================================================
-    with tab_delete:
-        st.subheader("Delete an Energy Reading")
-        readings = get_all_energy_readings()
+                submitted = st.form_submit_button("Add Reading")
 
-        if readings:
-            selected_reading_del = st.selectbox(
-                "Select a reading to delete",
-                readings,
-                format_func=lambda r: (
-                    f"Reading ID {r[0]} | {r[2]} | Date: {r[4]} | {float(r[5]):,.1f} kWh"
-                ),
-                key="select_delete_reading"
-            )
-
-            st.warning(
-                f"Deleting Reading ID **{selected_reading_del[0]}** will remove the consumption record "
-                f"and its emission factor assignment from READING_FACTOR."
-            )
-
-            confirm_del_reading = st.checkbox(
-                f"I confirm that I want to permanently delete Reading ID {selected_reading_del[0]}",
-                key="confirm_delete_reading_box"
-            )
-
-            if st.button("🗑️ Delete Selected Reading", disabled=not confirm_del_reading):
-                try:
-                    delete_energy_reading(selected_reading_del[0])
-                    st.success(f"Reading ID {selected_reading_del[0]} deleted successfully!")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not delete reading: {exc}")
-        else:
-            st.info("No energy readings available to delete.")
+                if submitted:
+                    try:
+                        add_energy_reading(
+                            reading_id=int(reading_id),
+                            building_id=int(building[0]),
+                            reading_date=reading_date,
+                            consumption_kwh=float(consumption)
+                        )
+                        st.success("Electricity reading added successfully!")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not add reading: {exc}")
